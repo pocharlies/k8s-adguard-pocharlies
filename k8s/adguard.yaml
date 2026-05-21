@@ -1,0 +1,208 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adguard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adguard-config
+  namespace: adguard
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 2Gi } }
+  storageClassName: longhorn
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adguard-data
+  namespace: adguard
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+  storageClassName: longhorn
+---
+# Seed config — copied to PVC by init container only if AdGuardHome.yaml absent.
+# Users section: admin / Homelab2024! (bcrypt) — change via UI after first run.
+# Rewrites: *.lan.e-dani.com + *.k8s.lan → 192.168.50.240 (Traefik LAN VIP)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adguard-seed-config
+  namespace: adguard
+data:
+  AdGuardHome.yaml: |
+    http:
+      address: 0.0.0.0:80
+      session_ttl: 720h
+    users:
+      - name: admin
+        password: "$2b$10$uOW9uzdUJyakwmY5uIKjsuameHEzb0jjJTfeE7DRjjsdIMkmGD6yW"
+    auth_attempts: 5
+    block_auth_min: 15
+    dns:
+      bind_hosts:
+        - 0.0.0.0
+      port: 53
+      upstream_dns:
+        - 1.1.1.1
+        - 8.8.8.8
+        - 1.0.0.1
+        - 8.8.4.4
+      bootstrap_dns:
+        - 1.1.1.1
+        - 8.8.8.8
+      upstream_mode: parallel
+      cache_size: 4194304
+      filtering_enabled: true
+      filters_update_interval: 24
+    filtering:
+      rewrites:
+        - domain: "*.lan.e-dani.com"
+          answer: "192.168.50.240"
+          enabled: true
+        - domain: "*.k8s.lan"
+          answer: "192.168.50.240"
+          enabled: true
+      rewrites_enabled: true
+      filtering_enabled: true
+      protection_enabled: true
+      parental_enabled: false
+      safebrowsing_enabled: false
+    filters:
+      - enabled: true
+        url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+        name: AdGuard DNS filter
+        id: 1
+    querlog:
+      interval: 2160h
+      size_memory: 1000
+      enabled: true
+      file_enabled: false
+    statistics:
+      interval: 24h
+      enabled: true
+    dhcp:
+      enabled: false
+      interface_name: ""
+      local_domain_name: lan
+    os:
+      group: ""
+      user: ""
+      rlimit_nofile: 0
+    schema_version: 31
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adguard
+  namespace: adguard
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: adguard } }
+  template:
+    metadata: { labels: { app: adguard } }
+    spec:
+      # AdGuard Home is multi-arch (amd64+arm64); allow scheduling on any LAN node
+      nodeSelector:
+        topology: lan
+      initContainers:
+        # Seed config only on first run (PVC empty) — never overwrites existing config
+        - name: config-seed
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /conf/AdGuardHome.yaml ]; then
+                echo "Seeding AdGuardHome.yaml from ConfigMap..."
+                cp /seed/AdGuardHome.yaml /conf/AdGuardHome.yaml
+                echo "Done."
+              else
+                echo "Config already exists, skipping seed."
+              fi
+          volumeMounts:
+            - { name: config, mountPath: /conf }
+            - { name: seed,   mountPath: /seed, readOnly: true }
+      containers:
+        - name: adguard
+          image: adguard/adguardhome:v0.107.69
+          ports:
+            - { name: dns-udp, containerPort: 53, protocol: UDP }
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+            - { name: web,     containerPort: 80, protocol: TCP }
+            - { name: setup,   containerPort: 3000, protocol: TCP }
+          volumeMounts:
+            - { name: config, mountPath: /opt/adguardhome/conf }
+            - { name: data,   mountPath: /opt/adguardhome/work }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { memory: 512Mi }
+      volumes:
+        - { name: config, persistentVolumeClaim: { claimName: adguard-config } }
+        - { name: data,   persistentVolumeClaim: { claimName: adguard-data } }
+        - { name: seed,   configMap: { name: adguard-seed-config } }
+---
+# DNS service — LoadBalancer with dedicated VIP .241
+apiVersion: v1
+kind: Service
+metadata:
+  name: adguard-dns
+  namespace: adguard
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.50.241
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: { app: adguard }
+  ports:
+    - { name: dns-udp, port: 53, targetPort: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, targetPort: 53, protocol: TCP }
+---
+# Web UI — ClusterIP, exposed via Traefik
+apiVersion: v1
+kind: Service
+metadata:
+  name: adguard-web
+  namespace: adguard
+spec:
+  type: ClusterIP
+  selector: { app: adguard }
+  ports:
+    - { name: web,   port: 80,   targetPort: 80 }
+    - { name: setup, port: 3000, targetPort: 3000 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: adguard-web
+  namespace: adguard
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`adguard.lan.e-dani.com`)
+      kind: Rule
+      services:
+        - name: adguard-web
+          port: 80
+  tls:
+    secretName: wildcard-lan-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: adguard-setup
+  namespace: adguard
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`adguard-setup.lan.e-dani.com`)
+      kind: Rule
+      services:
+        - name: adguard-web
+          port: 3000
+  tls:
+    secretName: wildcard-lan-tls
